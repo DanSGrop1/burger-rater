@@ -184,6 +184,8 @@ html,body{height:100%;height:100dvh;font-family:-apple-system,BlinkMacSystemFont
 .modal h3{font-size:17px;font-weight:700;color:var(--text);margin-bottom:8px}
 .modal p{font-size:14px;color:var(--text-2);line-height:1.5;margin-bottom:18px}
 .modal-actions{display:flex;gap:10px}
+.modal-actions[style*="column"] button{margin-bottom:0}
+.modal-actions[style*="column"]{gap:8px}
 .modal-actions button{flex:1;padding:12px;font-size:14px;font-weight:700;font-family:inherit;border-radius:9px;cursor:pointer;border:none}
 .modal-cancel{background:var(--bg);color:var(--text-2);border:1px solid var(--border)!important}
 .modal-confirm{background:var(--alert);color:#fff}
@@ -401,6 +403,17 @@ html,body{height:100%;height:100dvh;font-family:-apple-system,BlinkMacSystemFont
     </div>
   </div>
 </div>
+<div class="modal-overlay" id="match-modal">
+  <div class="modal">
+    <h3>Is this the same place?</h3>
+    <p id="match-modal-body">We found a similar name already rated in this city.</p>
+    <div class="modal-actions" style="flex-direction:column">
+      <button class="modal-confirm" id="match-use-existing" style="background:var(--accent)">Use existing name</button>
+      <button class="modal-cancel" id="match-keep-mine">Keep my spelling as new</button>
+      <button class="modal-cancel" onclick="closeMatchModal()" style="border:none!important;color:var(--text-2)">Cancel</button>
+    </div>
+  </div>
+</div>
 
 <div class="mode-picker-overlay" id="mode-picker-overlay">
   <div class="mode-picker">
@@ -545,7 +558,7 @@ function switchMode(id){
 
 
 // ── Admin gating (Merge tab) ───────────────────────────────────────────────
-const ADMIN_PASS='Pumpernicke1'; // change to your secret
+const ADMIN_PASS='groppi'; // change to your secret
 function isAdmin(){try{return localStorage.getItem('graze_admin')==='1';}catch(e){return false;}}
 function applyAdminVisibility(){
   const btn=document.getElementById('nav-merge');
@@ -1006,6 +1019,65 @@ async function confirmMerge(target){
 }
 
 // ── Save with validation + debounce ──
+
+// ── Fuzzy name matching ────────────────────────────────────────────────────
+function levenshtein(a,b){
+  a=a||'';b=b||'';
+  const m=a.length,n=b.length;
+  if(!m)return n;if(!n)return m;
+  let prev=new Array(n+1);for(let j=0;j<=n;j++)prev[j]=j;
+  for(let i=1;i<=m;i++){
+    let cur=[i];
+    for(let j=1;j<=n;j++){
+      const cost=a.charCodeAt(i-1)===b.charCodeAt(j-1)?0:1;
+      cur[j]=Math.min(prev[j]+1,cur[j-1]+1,prev[j-1]+cost);
+    }
+    prev=cur;
+  }
+  return prev[n];
+}
+function similarity(a,b){
+  // 0..1 where 1 = identical, based on normalized edit distance
+  a=normalizeKey(a);b=normalizeKey(b);
+  if(!a||!b)return 0;
+  if(a===b)return 1;
+  const maxLen=Math.max(a.length,b.length);
+  return 1-(levenshtein(a,b)/maxLen);
+}
+function wordTokens(s){return normalizeKey(s).split(' ').filter(Boolean);}
+// Filler words that don't distinguish a place
+const FILLER=new Set(['burger','burgers','pizza','pizzeria','grill','cafe','restaurant','co','company','kitchen','bar','house','the','and','of']);
+function coreTokens(s){return wordTokens(s).filter(w=>!FILLER.has(w));}
+
+// Returns the best existing-name match in the same city, or null
+function findNameMatch(name,city){
+  const existing=getUniqueRestaurants(city); // same-city scope
+  let best=null,bestScore=0;
+  const inKey=normalizeKey(name);
+  const inCore=coreTokens(name).join(' ');
+  existing.forEach(ex=>{
+    const exKey=normalizeKey(ex);
+    if(exKey===inKey)return; // exact dupe handled elsewhere (already merges)
+    let score=similarity(name,ex);
+    // Boost: one name's words are a subset of the other (NADC ⊂ NADC Burger)
+    const inToks=wordTokens(name),exToks=wordTokens(ex);
+    const inSet=new Set(inToks),exSet=new Set(exToks);
+    const subset=inToks.every(w=>exSet.has(w))||exToks.every(w=>inSet.has(w));
+    if(subset)score=Math.max(score,0.9);
+    // Boost: identical core tokens after stripping filler (Joe's Burger vs Joe's)
+    const exCore=coreTokens(ex).join(' ');
+    if(inCore&&exCore&&inCore===exCore)score=Math.max(score,0.92);
+    if(score>bestScore){bestScore=score;best=ex;}
+  });
+  // Threshold: only surface plausible matches
+  return bestScore>=0.6?{match:best,score:bestScore}:null;
+}
+
+// State holder for the pending save while the match modal is open
+let _pendingSave=null;
+function closeMatchModal(){document.getElementById('match-modal').classList.remove('show');_pendingSave=null;_resetSaveBtn();}
+function _resetSaveBtn(){saving=false;const b=document.getElementById('btn-save');b.disabled=false;b.innerHTML=MODES[currentMode].emoji+' Save rating';}
+
 async function saveRating(){
   if(saving)return;
   const restaurant=document.getElementById('restaurant').value.trim();
@@ -1019,6 +1091,27 @@ async function saveRating(){
   if(!ok){haptic(30);return;}
   const missing=KPIs.filter(k=>scores[k.key]==null);
   if(missing.length){showToast(`${missing.length} KPI${missing.length>1?'s':''} still need a score`);haptic(30);return;}
+  // Fuzzy duplicate check (same city). If a similar name exists, confirm first.
+  const nm=findNameMatch(restaurant,city);
+  if(nm&&normalizeKey(nm.match)!==normalizeKey(restaurant)){
+    _pendingSave={restaurant,city,dateVal,notes};
+    document.getElementById('match-modal-body').innerHTML=
+      `You entered <strong>"${restaurant}"</strong>, but <strong>"${nm.match}"</strong> is already rated in ${city}.<br><br>Are these the same place?`;
+    const useBtn=document.getElementById('match-use-existing');
+    const keepBtn=document.getElementById('match-keep-mine');
+    useBtn.textContent=`Yes — use "${nm.match}"`;
+    keepBtn.textContent=`No — keep "${restaurant}"`;
+    useBtn.onclick=()=>{commitSave(nm.match,city,dateVal,notes);document.getElementById('match-modal').classList.remove('show');};
+    keepBtn.onclick=()=>{commitSave(restaurant,city,dateVal,notes);document.getElementById('match-modal').classList.remove('show');};
+    document.getElementById('match-modal').classList.add('show');
+    haptic(15);
+    return;
+  }
+  commitSave(restaurant,city,dateVal,notes);
+}
+
+async function commitSave(restaurant,city,dateVal,notes){
+  if(saving)return;
   saving=true;
   const btn=document.getElementById('btn-save');btn.disabled=true;btn.textContent='Saving…';
   let w=0;KPIs.forEach(k=>{w+=scores[k.key]*k.weight;});
@@ -1035,7 +1128,7 @@ async function saveRating(){
     showToast('Rating saved!');
     setTimeout(()=>{clearFormFields();populateCityDropdown();},900);
   }catch(e){showToast('Save failed — check connection');console.error(e);}
-  finally{saving=false;btn.disabled=false;btn.innerHTML='<span id="save-emoji">🍔</span> Save rating';}
+  finally{saving=false;btn.disabled=false;btn.innerHTML=MODES[currentMode].emoji+' Save rating';}
 }
 
 function askClearForm(){
